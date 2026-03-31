@@ -1,57 +1,101 @@
 #!/usr/bin/env python3
 """
-Raspberry Pi DAC Controller - 16 Camera Audio Gain Control (Grass Valley XCU)
-Controls audio gain levels via 8x MCP4728 I2C DAC chips for Grass Valley camera XCUs
-Architecture: 8 MCP4728 (4-channel DAC each), 1 chip per 2 cameras, voltage output 0-5V
+Grass Valley XCU - DAC Audio Controller (32 Cameras)
+Controls audio gain via Arduino Nano Every + W5500 + MCP4728 DAC over TCP Ethernet.
+
+Architecture:
+  Raspberry Pi (GUI) → TCP → Arduino Nano A (W5500) → I2C → 8x MCP4728 → CAM 1-16
+                     → TCP → Arduino Nano B (W5500) → I2C → 8x MCP4728 → CAM 17-32
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
-import sys
+from tkinter import messagebox, simpledialog
+import socket
 import json
 import os
-import time
+import sys
+import threading
 
-# Try to import MCP4728 DAC library
-try:
-    import adafruit_mcp4728
-    import board
-    import busio
-    I2C_AVAILABLE = True
-except (ImportError, RuntimeError, NotImplementedError) as e:
-    I2C_AVAILABLE = False
-    print(f"Warning: MCP4728/I2C not available. Running in demo mode. Error: {e}")
 
+# ============================================================
+# Arduino TCP Node
+# ============================================================
+
+class ArduinoNode:
+    """Manages TCP connection to an Arduino Nano Every + W5500 node"""
+
+    def __init__(self, node_id, ip, port, camera_start, camera_end):
+        self.node_id = node_id
+        self.ip = ip
+        self.port = port
+        self.camera_start = camera_start
+        self.camera_end = camera_end
+        self.connected = False
+        self.detected_chips = []
+        self._lock = threading.Lock()
+
+    def send_command(self, cmd, timeout=2.0):
+        """Send a command to the Arduino and return the response"""
+        with self._lock:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((self.ip, self.port))
+                sock.sendall((cmd + '\n').encode())
+
+                response = b''
+                while True:
+                    chunk = sock.recv(256)
+                    if not chunk:
+                        break
+                    response += chunk
+                    if b'\n' in response:
+                        break
+
+                sock.close()
+                return response.decode().strip()
+            except (socket.error, socket.timeout, OSError):
+                self.connected = False
+                return None
+
+    def ping(self):
+        """Test connection to Arduino"""
+        result = self.send_command('PING', timeout=1.0)
+        self.connected = (result == 'PONG')
+        return self.connected
+
+    def scan(self):
+        """Scan for MCP4728 chips on this Arduino"""
+        result = self.send_command('SCAN')
+        if result and result.startswith('CHIPS '):
+            chips_str = result[6:]
+            if chips_str == 'none':
+                self.detected_chips = []
+            else:
+                self.detected_chips = chips_str.split(',')
+            self.connected = True
+        else:
+            self.detected_chips = []
+        return self.detected_chips
+
+    def set_dac(self, chip, channel, value):
+        """Set DAC output value"""
+        result = self.send_command(f'SET {chip} {channel} {value}')
+        return result == 'OK'
+
+    def get_id(self):
+        """Get firmware identification"""
+        return self.send_command('ID')
+
+
+# ============================================================
+# Main Application
+# ============================================================
 
 class DACControllerApp:
-    """Main application class for DAC controller with 16 camera/microphone gain presets (Grass Valley XCU)"""
-    
-    # I2C Configuration: 8x MCP4728 DAC chips
-    # Each MCP4728 has 4 analog output channels (A, B, C, D)
-    # Total: 8 chips × 4 channels = 32 outputs (32 used: 16 cameras × 2 mics)
-    
-    # Hardware Architecture:
-    # - 16 cameras with 2 microphones each = 32 audio channels
-    # - Each MCP4728 controls 2 cameras (4 channels: Mic1A, Mic2A, Mic1B, Mic2B)
-    # - Output voltage 0-5V controls audio gain level on XCU SubD-15 connector
-    # - Pin 6: Audio 1 level, Pin 14: Audio 2 level, Pin 15: GND
-    
-    # MCP4728 I2C addresses (default 0x60, configurable)
-    DAC_ADDRESSES = [
-        0x60,  # Chip 0: CAM 1-2
-        0x61,  # Chip 1: CAM 3-4
-        0x62,  # Chip 2: CAM 5-6
-        0x63,  # Chip 3: CAM 7-8
-        0x64,  # Chip 4: CAM 9-10
-        0x65,  # Chip 5: CAM 11-12
-        0x66,  # Chip 6: CAM 13-14
-        0x67,  # Chip 7: CAM 15-16
-    ]
-    
+    """Main application: 32 camera audio gain control via Arduino nodes"""
+
     # Gain level presets: dBu label → DAC voltage → 12-bit DAC value
-    # MCP4728 with VDD=5V reference: value = voltage / 5.0 * 4096
-    # Grass Valley XCU SubD-15 connector: 0-5V analog input on pins 6 and 14
-    # Resistor ladder: 8x 1kΩ from 5V (pin 7) to GND (pin 15)
     GAIN_PRESETS = {
         '-22 dBu': {'voltage': 4.3, 'dac_value': 3522},
         '-28 dBu': {'voltage': 3.7, 'dac_value': 3031},
@@ -62,650 +106,545 @@ class DACControllerApp:
         '-58 dBu': {'voltage': 0.7, 'dac_value': 573},
         '-64 dBu': {'voltage': 0.0, 'dac_value': 0},
     }
-    
-    # Ordered list of gain levels (highest to lowest sensitivity)
-    GAIN_LEVELS = ['-22 dBu', '-28 dBu', '-34 dBu', '-40 dBu', '-46 dBu', '-52 dBu', '-58 dBu', '-64 dBu']
-    
-    # Camera configuration: maps camera name → {mic_name: (chip_index, channel)}
-    # Channel: 'a'=channel A, 'b'=channel B, 'c'=channel C, 'd'=channel D
-    CAMERAS = {}
-    
+
+    GAIN_LEVELS = ['-22 dBu', '-28 dBu', '-34 dBu', '-40 dBu',
+                   '-46 dBu', '-52 dBu', '-58 dBu', '-64 dBu']
+
     def __init__(self, root):
-        global I2C_AVAILABLE
-        
         self.root = root
-        self.root.title("Control de Audio DAC - 16 Cámaras Grass Valley (8 MCP4728)")
-        
-        # Fullscreen (works on Raspberry Pi OS/Linux)
+        self.root.title("Control de Audio DAC - 32 Cámaras Grass Valley")
+
+        # Fullscreen
         self.root.attributes('-fullscreen', True)
-        
-        # Allow exit with F11 or ESC
         self.root.bind('<F11>', lambda e: self.root.attributes('-fullscreen', False))
         self.root.bind('<Escape>', lambda e: self.root.attributes('-fullscreen', False))
-        
-        # Configuration file paths
-        self.config_file = os.path.expanduser("~/camera_names_gv_config.json")
+
+        # Config paths
+        self.app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.config_dir = os.path.join(self.app_dir, 'config')
+        self.nodes_file = os.path.join(self.config_dir, 'nodes.json')
+        self.names_file = os.path.expanduser("~/camera_names_gv_config.json")
         self.states_file = os.path.expanduser("~/camera_states_gv_config.json")
-        
-        # Build camera/DAC channel mapping
+
+        # Load Arduino nodes
+        self.nodes = self._load_nodes()
+
+        # Build camera mapping
+        self.CAMERAS = {}
         self._build_camera_mapping()
-        
-        # Load custom camera names
+
+        # Camera names
+        self.camera_names = list(self.CAMERAS.keys())
+        self.num_cameras = len(self.camera_names)
         self.camera_custom_names = self._load_camera_names()
-        
-        # Initialize DAC chips
-        self.dac_chips = []
-        self.detected_addresses = []
-        if I2C_AVAILABLE:
-            try:
-                # Initialize I2C bus
-                self.i2c = busio.I2C(board.SCL, board.SDA)
-                
-                # Scan for available DAC chips
-                while not self.i2c.try_lock():
-                    pass
-                devices = self.i2c.scan()
-                self.i2c.unlock()
-                
-                print(f"I2C devices found: {[hex(d) for d in devices]}")
-                
-                # Initialize each detected MCP4728 chip
-                for addr in self.DAC_ADDRESSES:
-                    if addr in devices:
-                        try:
-                            dac = adafruit_mcp4728.MCP4728(self.i2c, address=addr)
-                            self.dac_chips.append(dac)
-                            self.detected_addresses.append(addr)
-                            print(f"✓ Initialized MCP4728 at address 0x{addr:02X}")
-                        except Exception as e:
-                            print(f"✗ Failed to initialize MCP4728 at 0x{addr:02X}: {e}")
-                            self.dac_chips.append(None)
-                    else:
-                        self.dac_chips.append(None)  # Keep index aligned
-                        print(f"- No MCP4728 at address 0x{addr:02X}")
-                
-                if not self.detected_addresses:
-                    print("No MCP4728 chips detected. Running in demo mode.")
-                    I2C_AVAILABLE = False
-                else:
-                    print(f"Successfully initialized {len(self.detected_addresses)} MCP4728 chip(s)")
-                    
-            except Exception as e:
-                print(f"Error initializing I2C: {e}")
-                I2C_AVAILABLE = False
-        
-        # Store microphone states: {(camera_name, mike_name): current_gain_level}
-        # Load saved states or initialize with default -40 dBu (mid-range)
+
+        # Microphone states
         saved_states = self._load_microphone_states()
         self.mike_states = {}
         for cam_name, mikes in self.CAMERAS.items():
             for mike_name in mikes.keys():
                 key = (cam_name, mike_name)
                 self.mike_states[key] = saved_states.get(key, '-40 dBu')
-        
-        # Store UI elements: {(camera_name, mike_name): {'buttons': {level: Button}}}
+
+        # UI storage
         self.mike_ui = {}
-        
-        # Camera names list
-        self.camera_names = list(self.CAMERAS.keys())
-        
-        # Track if states were loaded from file
+        self.node_status_labels = {}
+
+        # Track loaded states
         self.states_loaded_from_file = len(saved_states) > 0
-        
-        # Apply saved states to hardware
-        if I2C_AVAILABLE and self.dac_chips:
-            self._restore_all_saved_states()
-        
+
+        # Connect to Arduino nodes and restore states
+        self._connect_all_nodes()
+        self._restore_all_saved_states()
+
+        # Build GUI
         self.create_widgets()
-    
-    def _build_camera_mapping(self):
-        """Build the camera to DAC channel mapping dynamically
-        
-        Architecture:
-        - Each MCP4728 has 4 channels (A, B, C, D)
-        - Channel A: Camera N, Mic 1
-        - Channel B: Camera N, Mic 2
-        - Channel C: Camera N+1, Mic 1
-        - Channel D: Camera N+1, Mic 2
-        - 2 cameras per MCP4728 chip
-        """
-        for cam_num in range(1, 17):  # 16 cameras
-            cam_name = f'CAM {cam_num}'
-            self.CAMERAS[cam_name] = {}
-            
-            # Determine which chip for this camera
-            # Camera 1,2 → Chip 0; Camera 3,4 → Chip 1; etc.
-            chip_index = (cam_num - 1) // 2
-            
-            # Determine if this is the first or second camera on the chip
-            is_second_camera = (cam_num - 1) % 2 == 1
-            
-            if is_second_camera:
-                self.CAMERAS[cam_name]['Mic 1'] = (chip_index, 'c')
-                self.CAMERAS[cam_name]['Mic 2'] = (chip_index, 'd')
-            else:
-                self.CAMERAS[cam_name]['Mic 1'] = (chip_index, 'a')
-                self.CAMERAS[cam_name]['Mic 2'] = (chip_index, 'b')
-    
-    def _load_camera_names(self):
-        """Load custom camera names from configuration file"""
+
+        # Periodic connection check
+        self._schedule_connection_check()
+
+    # ========================================================
+    # Node Management
+    # ========================================================
+
+    def _load_nodes(self):
+        """Load Arduino node configuration from JSON"""
+        nodes = []
         try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r', encoding='utf-8') as f:
+            if os.path.exists(self.nodes_file):
+                with open(self.nodes_file, 'r') as f:
+                    config = json.load(f)
+                for n in config.get('nodes', []):
+                    node = ArduinoNode(
+                        node_id=n['id'],
+                        ip=n['ip'],
+                        port=n.get('port', 5000),
+                        camera_start=n['camera_start'],
+                        camera_end=n['camera_end']
+                    )
+                    nodes.append(node)
+        except Exception as e:
+            print(f"Error loading nodes config: {e}")
+
+        if not nodes:
+            # Default: 2 nodes
+            nodes = [
+                ArduinoNode('A', '192.168.10.11', 5000, 1, 16),
+                ArduinoNode('B', '192.168.10.12', 5000, 17, 32),
+            ]
+        return nodes
+
+    def _connect_all_nodes(self):
+        """Try to connect to all Arduino nodes"""
+        for node in self.nodes:
+            try:
+                node.ping()
+                if node.connected:
+                    node.scan()
+                    fw = node.get_id()
+                    print(f"✓ Node {node.node_id} ({node.ip}): {fw} - Chips: {node.detected_chips}")
+                else:
+                    print(f"✗ Node {node.node_id} ({node.ip}): not reachable")
+            except Exception as e:
+                print(f"✗ Node {node.node_id} ({node.ip}): {e}")
+
+    def _schedule_connection_check(self):
+        """Periodically check Arduino connections"""
+        def check():
+            for node in self.nodes:
+                was_connected = node.connected
+                node.ping()
+                if node.connected != was_connected:
+                    self._update_node_status_ui()
+            self.root.after(5000, check)
+        self.root.after(5000, check)
+
+    # ========================================================
+    # Camera Mapping
+    # ========================================================
+
+    def _build_camera_mapping(self):
+        """Build camera → (node, chip_index, channel) mapping"""
+        for node in self.nodes:
+            for cam_num in range(node.camera_start, node.camera_end + 1):
+                cam_name = f'CAM {cam_num}'
+                self.CAMERAS[cam_name] = {}
+
+                # Local camera index within this node (0-15)
+                local_idx = cam_num - node.camera_start
+
+                # Chip index within this node (0-7)
+                chip_index = local_idx // 2
+
+                # First or second camera on the chip
+                is_second = local_idx % 2 == 1
+
+                if is_second:
+                    self.CAMERAS[cam_name]['Mic 1'] = (node, chip_index, 2)  # Channel C
+                    self.CAMERAS[cam_name]['Mic 2'] = (node, chip_index, 3)  # Channel D
+                else:
+                    self.CAMERAS[cam_name]['Mic 1'] = (node, chip_index, 0)  # Channel A
+                    self.CAMERAS[cam_name]['Mic 2'] = (node, chip_index, 1)  # Channel B
+
+    # ========================================================
+    # Persistence
+    # ========================================================
+
+    def _load_camera_names(self):
+        """Load custom camera names"""
+        try:
+            if os.path.exists(self.names_file):
+                with open(self.names_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            else:
-                return {f'CAM {i}': f'CAM {i}' for i in range(1, 17)}
         except Exception as e:
             print(f"Error loading camera names: {e}")
-            return {f'CAM {i}': f'CAM {i}' for i in range(1, 17)}
-    
+        return {f'CAM {i}': f'CAM {i}' for i in range(1, self.num_cameras + 1)}
+
     def _save_camera_names(self):
-        """Save custom camera names to configuration file"""
+        """Save custom camera names"""
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            with open(self.names_file, 'w', encoding='utf-8') as f:
                 json.dump(self.camera_custom_names, f, indent=2, ensure_ascii=False)
             return True
         except Exception as e:
             messagebox.showerror("Error", f"Error al guardar nombres: {e}")
             return False
-    
+
     def _load_microphone_states(self):
-        """Load microphone gain states from configuration file"""
+        """Load microphone gain states"""
         try:
             if os.path.exists(self.states_file):
                 with open(self.states_file, 'r', encoding='utf-8') as f:
-                    saved_states = json.load(f)
-                    return {tuple(key.split('|')): value for key, value in saved_states.items()}
-            else:
-                return {}
+                    saved = json.load(f)
+                    return {tuple(k.split('|')): v for k, v in saved.items()}
         except Exception as e:
-            print(f"Error loading microphone states: {e}")
-            return {}
-    
+            print(f"Error loading states: {e}")
+        return {}
+
     def _save_microphone_states(self):
-        """Save microphone gain states to configuration file"""
+        """Save microphone gain states"""
         try:
-            states_to_save = {f"{cam}|{mike}": level for (cam, mike), level in self.mike_states.items()}
+            data = {f"{cam}|{mike}": level for (cam, mike), level in self.mike_states.items()}
             with open(self.states_file, 'w', encoding='utf-8') as f:
-                json.dump(states_to_save, f, indent=2, ensure_ascii=False)
-            print(f"✓ States saved to {self.states_file}")
+                json.dump(data, f, indent=2, ensure_ascii=False)
             return True
         except Exception as e:
-            print(f"✗ Error saving microphone states: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error saving states: {e}")
             return False
-    
+
+    # ========================================================
+    # Hardware Control
+    # ========================================================
+
+    def _apply_gain_hardware(self, camera_name, mike_name, level):
+        """Send DAC value to Arduino node"""
+        if level not in self.GAIN_PRESETS:
+            return False
+
+        node, chip_index, channel = self.CAMERAS[camera_name][mike_name]
+        dac_value = self.GAIN_PRESETS[level]['dac_value']
+
+        if not node.connected:
+            return False
+
+        return node.set_dac(chip_index, channel, dac_value)
+
+    def _restore_all_saved_states(self):
+        """Restore all saved states to hardware"""
+        for cam_name in self.camera_names:
+            for mike_name in ['Mic 1', 'Mic 2']:
+                level = self.mike_states.get((cam_name, mike_name), '-40 dBu')
+                try:
+                    self._apply_gain_hardware(cam_name, mike_name, level)
+                except Exception:
+                    pass
+
+    # ========================================================
+    # GUI
+    # ========================================================
+
     def get_camera_display_name(self, camera_key):
-        """Get the display name for a camera (custom or default)"""
         return self.camera_custom_names.get(camera_key, camera_key)
-    
+
     def edit_camera_name_dialog(self, camera_key):
-        """Open dialog to edit camera name"""
         current_name = self.get_camera_display_name(camera_key)
-        
         new_name = simpledialog.askstring(
             "Editar Nombre de Cámara",
             f"Ingrese el nuevo nombre para {camera_key}:",
             initialvalue=current_name,
             parent=self.root
         )
-        
         if new_name and new_name.strip():
             self.camera_custom_names[camera_key] = new_name.strip()
             if self._save_camera_names():
                 self.display_all_cameras_grid()
-                messagebox.showinfo("Éxito", f"Nombre actualizado: {new_name.strip()}")
-    
-    def _set_dac_output(self, chip_index, channel, dac_value):
-        """Set a specific DAC channel output value
-        
-        Args:
-            chip_index: Index of the MCP4728 chip (0-7)
-            channel: Channel letter ('a', 'b', 'c', 'd')
-            dac_value: 12-bit DAC value (0-4095)
-        """
-        if not I2C_AVAILABLE or chip_index >= len(self.dac_chips):
-            return False
-        
-        dac = self.dac_chips[chip_index]
-        if dac is None:
-            return False
-        
-        try:
-            # MCP4728 channels are accessed as attributes
-            ch = getattr(dac, f'channel_{channel}')
-            ch.value = dac_value << 4  # MCP4728 library expects 16-bit value, shift 12-bit to upper
-            return True
-        except Exception as e:
-            print(f"✗ Error setting DAC chip {chip_index} channel {channel} to {dac_value}: {e}")
-            return False
-    
-    def _restore_all_saved_states(self):
-        """Restore saved states for all microphones by setting DAC outputs"""
-        if not I2C_AVAILABLE:
-            return
-        
-        for cam_name in self.camera_names:
-            for mike_name in ['Mic 1', 'Mic 2']:
-                level = self.mike_states.get((cam_name, mike_name), '-40 dBu')
-                try:
-                    self._apply_gain_hardware(cam_name, mike_name, level)
-                    print(f"{cam_name}: {mike_name}={level}")
-                except Exception as e:
-                    print(f"Error restoring {mike_name} for {cam_name}: {e}")
-        
-        print("Saved states restored for all microphones")
-    
-    def _apply_gain_hardware(self, camera_name, mike_name, level):
-        """Apply gain level to hardware DAC output"""
-        if level not in self.GAIN_PRESETS:
-            print(f"Unknown level: {level}")
-            return False
-        
-        chip_index, channel = self.CAMERAS[camera_name][mike_name]
-        dac_value = self.GAIN_PRESETS[level]['dac_value']
-        
-        return self._set_dac_output(chip_index, channel, dac_value)
-    
+
     def create_widgets(self):
-        """Create the GUI widgets - all 16 cameras in 4x4 grid, fullscreen"""
-        
-        # Configure root background
+        """Create GUI - 32 cameras in 8x4 grid"""
         self.root.configure(bg='#808080')
-        
-        # Bottom control buttons (pack first so they stay at bottom)
+
+        # Bottom bar
         button_frame = tk.Frame(self.root, bg='#808080')
         button_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=5)
-        
-        # Left side container for version and status
-        left_status_container = tk.Frame(button_frame, bg='#808080')
-        left_status_container.pack(side=tk.LEFT, padx=5)
-        
-        # Version date label
-        version_label = tk.Label(
-            left_status_container,
-            text="v2026.02.25 - Grass Valley XCU - 8 MCP4728 DAC",
-            font=("Arial", 8),
-            bg='#808080',
-            fg='#00FF00'
-        )
-        version_label.pack(anchor='w')
-        
-        # Status indicator
-        chip_count = len(self.detected_addresses) if I2C_AVAILABLE else 0
-        if I2C_AVAILABLE:
-            addr_list = ", ".join([f"0x{a:02X}" for a in self.detected_addresses])
-            status_text = f"I2C OK - {chip_count} DAC(s) [{addr_list}] - {chip_count * 4} canales"
-            status_color = "#00FF00" if chip_count > 0 else "#FFA500"
-        else:
-            status_text = "Modo DEMO - Sin hardware I2C"
-            status_color = "#FFA500"
-        
-        status_label = tk.Label(
-            left_status_container,
-            text=status_text,
-            font=("Arial", 10),
-            bg='#808080',
-            fg=status_color
-        )
-        status_label.pack(anchor='w')
-        
-        # Control buttons on the right
+
+        # Left: version + node status
+        left_container = tk.Frame(button_frame, bg='#808080')
+        left_container.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(
+            left_container,
+            text="v2026.03.31 - Grass Valley XCU - Arduino W5500 + MCP4728",
+            font=("Arial", 8), bg='#808080', fg='#00FF00'
+        ).pack(anchor='w')
+
+        # Node status indicators
+        status_frame = tk.Frame(left_container, bg='#808080')
+        status_frame.pack(anchor='w')
+        for node in self.nodes:
+            color = "#00FF00" if node.connected else "#FF4444"
+            chips = len(node.detected_chips) if node.connected else 0
+            text = f"Node {node.node_id} ({node.ip}): {'OK' if node.connected else 'OFF'} - {chips} DACs"
+            lbl = tk.Label(
+                status_frame, text=text,
+                font=("Arial", 9), bg='#808080', fg=color
+            )
+            lbl.pack(side=tk.LEFT, padx=10)
+            self.node_status_labels[node.node_id] = lbl
+
+        # Right: buttons
+        # Quit
         quit_frame = tk.Frame(button_frame, relief=tk.RAISED, bd=3, bg='light grey')
         quit_frame.pack(side=tk.RIGHT, padx=5)
         quit_btn = tk.Label(
-            quit_frame,
-            text="Salir",
-            font=("Arial", 11, "bold"),
-            bg='light grey',
-            fg='black',
-            cursor='hand2',
-            padx=15,
-            pady=5
+            quit_frame, text="Salir", font=("Arial", 11, "bold"),
+            bg='light grey', fg='black', cursor='hand2', padx=15, pady=5
         )
         quit_btn.pack()
         quit_btn.bind('<Button-1>', lambda e: self.quit_application())
         quit_frame.bind('<Button-1>', lambda e: self.quit_application())
         quit_frame.config(cursor='hand2')
-        
-        # All buttons for applying levels to all cameras (show a subset to fit)
+
+        # All-level buttons
         all_levels_to_show = ['-22 dBu', '-34 dBu', '-40 dBu', '-52 dBu', '-64 dBu']
         for level in reversed(all_levels_to_show):
-            all_frame = tk.Frame(button_frame, relief=tk.RAISED, bd=3, bg='light grey')
-            all_frame.pack(side=tk.RIGHT, padx=2)
-            
+            f = tk.Frame(button_frame, relief=tk.RAISED, bd=3, bg='light grey')
+            f.pack(side=tk.RIGHT, padx=2)
             display_text = level.replace(' dBu', '')
-            all_btn = tk.Label(
-                all_frame,
-                text=f"All {display_text}",
-                font=("Arial", 10, "bold"),
-                bg='light grey',
-                fg='black',
-                cursor='hand2',
-                padx=10,
-                pady=5
+            btn = tk.Label(
+                f, text=f"All {display_text}", font=("Arial", 10, "bold"),
+                bg='light grey', fg='black', cursor='hand2', padx=10, pady=5
             )
-            all_btn.pack()
-            
+            btn.pack()
+
             def make_all_handler(lvl=level):
                 def handler(e):
                     self.set_all_to_level(lvl)
                     return "break"
                 return handler
-            
-            all_btn.bind('<Button-1>', make_all_handler())
-            all_frame.bind('<Button-1>', make_all_handler())
-            all_frame.config(cursor='hand2')
-        
-        # Save states button
+
+            btn.bind('<Button-1>', make_all_handler())
+            f.bind('<Button-1>', make_all_handler())
+            f.config(cursor='hand2')
+
+        # Save button
         save_frame = tk.Frame(button_frame, relief=tk.RAISED, bd=3, bg='light grey')
         save_frame.pack(side=tk.RIGHT, padx=5)
         save_btn = tk.Label(
-            save_frame,
-            text="Guardar Estados",
-            font=("Arial", 11, "bold"),
-            bg='light grey',
-            fg='black',
-            cursor='hand2',
-            padx=15,
-            pady=5
+            save_frame, text="Guardar Estados", font=("Arial", 11, "bold"),
+            bg='light grey', fg='black', cursor='hand2', padx=15, pady=5
         )
         save_btn.pack()
         save_btn.bind('<Button-1>', lambda e: self.manual_save_states())
         save_frame.bind('<Button-1>', lambda e: self.manual_save_states())
         save_frame.config(cursor='hand2')
-        
-        # Main content frame
+
+        # Main content
         self.content_frame = tk.Frame(self.root, bg='#808080')
         self.content_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Display all cameras in grid
+
         self.display_all_cameras_grid()
-        
-        # Show notification if states were loaded
+
+        # Notification for loaded states
         if self.states_loaded_from_file:
-            num_restored = sum(1 for key in self.mike_states.keys() if self.mike_states[key] != '-40 dBu')
+            num_restored = sum(1 for v in self.mike_states.values() if v != '-40 dBu')
             self.root.after(500, lambda: messagebox.showinfo(
                 "Estados Recuperados",
-                f"Se han cargado los estados guardados de la sesión anterior.\n\nNúmero de micrófonos con estado personalizado: {num_restored}"
+                f"Se han cargado los estados guardados.\n\nMicrófonos con estado personalizado: {num_restored}"
             ))
-    
+
     def display_all_cameras_grid(self):
-        """Display all 16 cameras in 4x4 grid, fullscreen for 1920x1080"""
-        # Clear existing content
+        """Display all cameras in grid: 8 columns x 4 rows"""
         for widget in self.content_frame.winfo_children():
             widget.destroy()
-        
-        # Clear all UI references
         self.mike_ui.clear()
-        
-        # Configure grid weights for expansion
-        for i in range(4):
+
+        cols = 8
+        rows = (self.num_cameras + cols - 1) // cols
+
+        for i in range(rows):
             self.content_frame.grid_rowconfigure(i, weight=1)
-            self.content_frame.grid_columnconfigure(i, weight=1)
-        
-        # Create 4 rows x 4 columns grid
-        for row_idx in range(4):
-            for col_idx in range(4):
-                cam_idx = row_idx * 4 + col_idx
-                camera_name = self.camera_names[cam_idx]
-                
-                # Camera container
-                cam_container = tk.Frame(self.content_frame, bg='#505050', relief=tk.RIDGE, bd=2)
-                cam_container.grid(row=row_idx, column=col_idx, sticky='nsew', padx=3, pady=3)
-                
-                # Configure internal expansion
-                cam_container.grid_rowconfigure(0, weight=0)  # Name label
-                cam_container.grid_rowconfigure(1, weight=1)  # Mic 1
-                cam_container.grid_rowconfigure(2, weight=1)  # Mic 2
-                cam_container.grid_columnconfigure(0, weight=1)
-                
-                # Camera name (double-click to edit)
-                display_name = self.get_camera_display_name(camera_name)
-                name_label = tk.Label(
-                    cam_container,
-                    text=display_name,
-                    font=("Arial", 14, "bold"),
-                    bg='#505050',
-                    fg='white',
-                    cursor='hand2'
+        for j in range(cols):
+            self.content_frame.grid_columnconfigure(j, weight=1)
+
+        for idx, camera_name in enumerate(self.camera_names):
+            row_idx = idx // cols
+            col_idx = idx % cols
+
+            cam_container = tk.Frame(self.content_frame, bg='#505050', relief=tk.RIDGE, bd=2)
+            cam_container.grid(row=row_idx, column=col_idx, sticky='nsew', padx=2, pady=2)
+
+            cam_container.grid_rowconfigure(0, weight=0)
+            cam_container.grid_rowconfigure(1, weight=1)
+            cam_container.grid_rowconfigure(2, weight=1)
+            cam_container.grid_columnconfigure(0, weight=1)
+
+            # Camera name
+            display_name = self.get_camera_display_name(camera_name)
+            name_label = tk.Label(
+                cam_container, text=display_name,
+                font=("Arial", 11, "bold"), bg='#505050', fg='white', cursor='hand2'
+            )
+            name_label.grid(row=0, column=0, sticky='ew', pady=(3, 5))
+            name_label.bind('<Double-Button-1>',
+                           lambda e, cam=camera_name: self.edit_camera_name_dialog(cam))
+
+            # Node indicator (small colored dot)
+            node, _, _ = self.CAMERAS[camera_name]['Mic 1']
+            node_color = "#00FF00" if node.connected else "#FF4444"
+            node_indicator = tk.Label(
+                cam_container, text=f"●{node.node_id}",
+                font=("Arial", 7), bg='#505050', fg=node_color
+            )
+            node_indicator.place(relx=1.0, x=-5, y=2, anchor='ne')
+
+            # Microphones
+            for mike_idx, mike_name in enumerate(['Mic 1', 'Mic 2']):
+                mike_frame = tk.Frame(cam_container, bg='#404040', relief=tk.GROOVE, bd=1)
+                mike_frame.grid(row=mike_idx + 1, column=0, sticky='nsew', padx=3, pady=2)
+
+                mike_frame.grid_columnconfigure(0, weight=0)
+                mike_frame.grid_columnconfigure(1, weight=1)
+                mike_frame.grid_rowconfigure(0, weight=1)
+
+                label = tk.Label(
+                    mike_frame, text=mike_name[-1],
+                    font=("Arial", 10, "bold"), bg='#404040', fg='#CCCCCC', width=2
                 )
-                name_label.grid(row=0, column=0, sticky='ew', pady=(5, 8))
-                name_label.bind('<Double-Button-1>', lambda e, cam=camera_name: self.edit_camera_name_dialog(cam))
-                
-                # Microphones
-                for mike_idx, mike_name in enumerate(['Mic 1', 'Mic 2']):
-                    # Microphone row frame
-                    mike_frame = tk.Frame(cam_container, bg='#404040', relief=tk.GROOVE, bd=2)
-                    mike_frame.grid(row=mike_idx+1, column=0, sticky='nsew', padx=5, pady=3)
-                    
-                    # Configure internal expansion
-                    mike_frame.grid_columnconfigure(0, weight=0)  # Label
-                    mike_frame.grid_columnconfigure(1, weight=1)  # Buttons
-                    mike_frame.grid_rowconfigure(0, weight=1)
-                    
-                    # Microphone label
-                    label = tk.Label(
-                        mike_frame,
-                        text=mike_name[-1],  # Just "1" or "2"
-                        font=("Arial", 12, "bold"),
-                        bg='#404040',
-                        fg='#CCCCCC',
-                        width=2
+                label.grid(row=0, column=0, sticky='ns', padx=(3, 2))
+
+                btn_container = tk.Frame(mike_frame, bg='#404040')
+                btn_container.grid(row=0, column=1, sticky='nsew', padx=2, pady=3)
+
+                for i in range(8):
+                    btn_container.grid_columnconfigure(i, weight=1)
+                btn_container.grid_rowconfigure(0, weight=1)
+
+                buttons = {}
+                for btn_idx, level in enumerate(self.GAIN_LEVELS):
+                    current_level = self.mike_states[(camera_name, mike_name)]
+                    is_active = (level == current_level)
+
+                    btn_frame = tk.Frame(
+                        btn_container, relief=tk.RAISED, bd=2,
+                        bg='blue' if is_active else 'light grey'
                     )
-                    label.grid(row=0, column=0, sticky='ns', padx=(5, 3))
-                    
-                    # Buttons container
-                    button_container = tk.Frame(mike_frame, bg='#404040')
-                    button_container.grid(row=0, column=1, sticky='nsew', padx=3, pady=5)
-                    
-                    # Configure button expansion - 8 buttons
-                    for i in range(8):
-                        button_container.grid_columnconfigure(i, weight=1)
-                    button_container.grid_rowconfigure(0, weight=1)
-                    
-                    # Create gain level buttons
-                    buttons = {}
-                    
-                    for btn_idx, level in enumerate(self.GAIN_LEVELS):
-                        current_level = self.mike_states[(camera_name, mike_name)]
-                        is_active = (level == current_level)
-                        
-                        btn_frame = tk.Frame(
-                            button_container,
-                            relief=tk.RAISED,
-                            bd=2,
-                            bg='blue' if is_active else 'light grey'
-                        )
-                        btn_frame.grid(row=0, column=btn_idx, sticky='nsew', padx=1)
-                        btn_frame.grid_rowconfigure(0, weight=1)
-                        btn_frame.grid_columnconfigure(0, weight=1)
-                        
-                        # Display label: just the number without "dBu"
-                        display_text = level.replace(' dBu', '')
-                        
-                        btn = tk.Label(
-                            btn_frame,
-                            text=display_text,
-                            font=("Arial", 11, "bold"),
-                            bg='blue' if is_active else 'light grey',
-                            fg='white' if is_active else 'black',
-                            cursor='hand2'
-                        )
-                        btn.grid(row=0, column=0, sticky='nsew', padx=3, pady=6)
-                        
-                        def make_click_handler(cam=camera_name, mike=mike_name, lvl=level):
-                            def handler(e):
-                                self.set_microphone_gain(cam, mike, lvl)
-                                return "break"
-                            return handler
-                        
-                        btn.bind('<Button-1>', make_click_handler())
-                        btn_frame.bind('<Button-1>', make_click_handler())
-                        btn_frame.config(cursor='hand2')
-                        
-                        buttons[level] = {'label': btn, 'frame': btn_frame}
-                    
-                    # Store UI references
-                    self.mike_ui[(camera_name, mike_name)] = {
-                        'buttons': buttons
-                    }
-    
+                    btn_frame.grid(row=0, column=btn_idx, sticky='nsew', padx=1)
+                    btn_frame.grid_rowconfigure(0, weight=1)
+                    btn_frame.grid_columnconfigure(0, weight=1)
+
+                    display_text = level.replace(' dBu', '')
+                    btn = tk.Label(
+                        btn_frame, text=display_text,
+                        font=("Arial", 9, "bold"),
+                        bg='blue' if is_active else 'light grey',
+                        fg='white' if is_active else 'black',
+                        cursor='hand2'
+                    )
+                    btn.grid(row=0, column=0, sticky='nsew', padx=2, pady=4)
+
+                    def make_click_handler(cam=camera_name, mike=mike_name, lvl=level):
+                        def handler(e):
+                            self.set_microphone_gain(cam, mike, lvl)
+                            return "break"
+                        return handler
+
+                    btn.bind('<Button-1>', make_click_handler())
+                    btn_frame.bind('<Button-1>', make_click_handler())
+                    btn_frame.config(cursor='hand2')
+
+                    buttons[level] = {'label': btn, 'frame': btn_frame}
+
+                self.mike_ui[(camera_name, mike_name)] = {'buttons': buttons}
+
+    def _update_node_status_ui(self):
+        """Update node connection indicators"""
+        for node in self.nodes:
+            if node.node_id in self.node_status_labels:
+                lbl = self.node_status_labels[node.node_id]
+                color = "#00FF00" if node.connected else "#FF4444"
+                chips = len(node.detected_chips) if node.connected else 0
+                text = f"Node {node.node_id} ({node.ip}): {'OK' if node.connected else 'OFF'} - {chips} DACs"
+                lbl.config(text=text, fg=color)
+
+    # ========================================================
+    # Actions
+    # ========================================================
+
     def set_microphone_gain(self, camera_name, mike_name, level, update_ui=True):
-        """Set the gain level for a microphone by setting DAC output voltage"""
+        """Set gain level for a microphone"""
         if level not in self.GAIN_PRESETS:
             return
-        
+
         # Apply to hardware
-        if I2C_AVAILABLE and self.dac_chips:
+        node, _, _ = self.CAMERAS[camera_name][mike_name]
+        if node.connected:
             try:
-                success = self._apply_gain_hardware(camera_name, mike_name, level)
-                if not success:
-                    chip_idx, channel = self.CAMERAS[camera_name][mike_name]
-                    if chip_idx < len(self.dac_chips) and self.dac_chips[chip_idx] is None:
-                        pass  # Chip not available, continue in demo mode
-                    else:
-                        messagebox.showerror("Error", f"Error al controlar DAC de {camera_name} {mike_name}")
-                        return
+                self._apply_gain_hardware(camera_name, mike_name, level)
             except Exception as e:
-                messagebox.showerror("Error", f"Error al controlar DAC de {camera_name} {mike_name}: {e}")
+                messagebox.showerror("Error", f"Error DAC {camera_name} {mike_name}: {e}")
                 return
-        
+
         # Update state
         self.mike_states[(camera_name, mike_name)] = level
-        
-        # Save states to file
         self._save_microphone_states()
-        
+
         # Update UI
         if update_ui and (camera_name, mike_name) in self.mike_ui:
             self.update_microphone_ui(camera_name, mike_name)
             self.root.update_idletasks()
-            self.root.update()
-    
+
     def update_microphone_ui(self, camera_name, mike_name):
-        """Update the UI elements for a microphone based on its current gain level"""
+        """Update button colors for a microphone"""
         key = (camera_name, mike_name)
         if key not in self.mike_ui:
             return
-        
+
         current_level = self.mike_states[key]
         ui = self.mike_ui[key]
-        
-        # Update button colors - highlight the active level with blue
+
         for level, btn_dict in ui['buttons'].items():
             label = btn_dict['label']
             frame = btn_dict['frame']
-            
+
             if level == current_level:
                 label.config(bg='blue', fg='white')
                 frame.config(bg='blue', relief=tk.SUNKEN)
             else:
                 label.config(bg='light grey', fg='black')
                 frame.config(bg='light grey', relief=tk.RAISED)
-        
-        # Force redraw
-        for btn_dict in ui['buttons'].values():
-            btn_dict['label'].update()
-            btn_dict['frame'].update()
-    
+
     def set_all_to_level(self, level):
-        """Set all microphones to the specified gain level"""
+        """Set all microphones to the specified level"""
         for camera_name in self.camera_names:
             for mike_name in ['Mic 1', 'Mic 2']:
                 self.set_microphone_gain(camera_name, mike_name, level, update_ui=False)
-        
-        # Now update UI for all visible microphones
+
         for camera_name in self.camera_names:
             for mike_name in ['Mic 1', 'Mic 2']:
                 if (camera_name, mike_name) in self.mike_ui:
                     self.update_microphone_ui(camera_name, mike_name)
-        
-        # Force GUI update
+
         self.root.update_idletasks()
-        self.root.update()
-        
         display_level = level.replace(' dBu', '')
-        messagebox.showinfo("Aplicado", f"Todas las cámaras han sido configuradas a {display_level} dBu")
-    
+        messagebox.showinfo("Aplicado", f"Todas las cámaras configuradas a {display_level} dBu")
+
     def manual_save_states(self, event=None):
-        """Manually save current microphone states"""
-        print(f"manual_save_states called - saving {len(self.mike_states)} states")
-        
-        success = self._save_microphone_states()
-        print(f"Save result: {success}")
-        
-        if success:
+        """Manually save states"""
+        if self._save_microphone_states():
             messagebox.showinfo(
                 "Éxito",
-                f"Estados guardados correctamente.\n\nArchivo: {self.states_file}\n\nLos estados se cargarán automáticamente al reiniciar la aplicación."
+                f"Estados guardados correctamente.\n\nArchivo: {self.states_file}"
             )
         else:
-            messagebox.showerror(
-                "Error",
-                "No se pudieron guardar los estados."
-            )
+            messagebox.showerror("Error", "No se pudieron guardar los estados.")
         return "break"
-    
-    def quit_application(self):
-        """Clean up and quit the application"""
-        if messagebox.askokcancel("Salir", "¿Está seguro que desea salir?"):
-            # Save states before exiting
-            print("Saving states before exit...")
-            if self._save_microphone_states():
-                print("✓ States saved successfully before exit")
-            else:
-                print("✗ Failed to save states before exit")
-            
-            self.cleanup()
-            self.root.destroy()
-    
-    def cleanup(self):
-        """Clean up DAC resources - set all outputs to 0V"""
-        if I2C_AVAILABLE and self.dac_chips:
-            try:
-                for chip_idx, dac in enumerate(self.dac_chips):
-                    if dac is not None:
-                        for ch_name in ['a', 'b', 'c', 'd']:
-                            try:
-                                ch = getattr(dac, f'channel_{ch_name}')
-                                ch.value = 0
-                            except Exception:
-                                pass
-                print("DAC controller cleanup completed - all 32 channels set to 0V")
-            except Exception as e:
-                print(f"Error during DAC cleanup: {e}")
 
+    def quit_application(self):
+        """Save and quit"""
+        if messagebox.askokcancel("Salir", "¿Está seguro que desea salir?"):
+            self._save_microphone_states()
+            self.root.destroy()
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    """Main entry point"""
     try:
         root = tk.Tk()
     except tk.TclError as e:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("ERROR: No se puede iniciar la interfaz gráfica")
-        print("="*60)
+        print("=" * 60)
         print(f"\nDetalle: {e}\n")
-        print("Este error ocurre porque no hay un servidor de display (X11) disponible.")
-        print("\nSoluciones posibles:\n")
-        print("1. Si está conectado por SSH:")
-        print("   - Reconecte usando: ssh -X usuario@raspberry")
-        print("   - O instale VNC para acceso gráfico remoto\n")
-        print("2. Si está en la Raspberry Pi directamente:")
-        print("   - Asegúrese de estar en el entorno gráfico (escritorio)")
-        print("   - Ejecute 'startx' si está en consola de texto\n")
-        print("3. Para ejecutar sin interfaz gráfica:")
-        print("   - Este programa requiere GUI y no puede ejecutarse en modo headless")
-        print("="*60 + "\n")
+        print("Ejecute desde el escritorio de la Raspberry Pi")
+        print("o use Screen Sharing en Raspberry Pi Connect.")
+        print("=" * 60 + "\n")
         sys.exit(1)
-    
+
     app = DACControllerApp(root)
-    
-    # Handle window close event
     root.protocol("WM_DELETE_WINDOW", app.quit_application)
-    
-    # Start the GUI event loop
     root.mainloop()
 
 

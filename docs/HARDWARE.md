@@ -1,61 +1,46 @@
-# Hardware - Control de Audio Grass Valley XCU via DAC MCP4728
+# Hardware - Control de Audio Grass Valley XCU via Arduino + W5500 + MCP4728
 
 ## Descripción General
 
-Sistema de control de ganancia de audio para 16 cámaras Grass Valley mediante DAC I2C.
-Cada XCU acepta una tensión analógica de 0 a 5V en su conector SubD-15 (Signalling Connector)
-para controlar el nivel de audio de cada micrófono.
+Sistema de control de ganancia de audio para 32 cámaras Grass Valley.
+La Raspberry Pi ejecuta la GUI y se comunica via TCP/Ethernet con 2 Arduino Nano Every,
+cada uno controlando 8 MCP4728 DAC (16 cámaras x 2 micrófonos).
 
 ## Componentes Necesarios
 
-| Cantidad | Componente | Especificación |
-|----------|------------|----------------|
-| 8 | MCP4728 (módulo breakout) | DAC I2C, 4 canales, 12 bits, salida 0-5V |
-| 1 | Raspberry Pi 4 | Con Raspberry Pi OS |
-| 16 | Conectores SubD-15 hembra | Uno por XCU |
-| - | Cable I2C | SDA + SCL + VCC + GND |
-| - | Cable multipar | Para conexión DAC → SubD-15 |
+- 2x Arduino Nano Every (ATmega4809)
+- 2x Módulo W5500 Ethernet
+- 16x MCP4728 (módulo breakout DAC I2C, 4 canales, 12 bits)
+- 1x Raspberry Pi 5 con Raspberry Pi OS
+- 1x Switch Ethernet (5 puertos mínimo)
+- 32x Conectores SubD-15 hembra (uno por XCU)
+- Cables Ethernet Cat5e/6
 
 ## Esquema General
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        RASPBERRY PI 4                               │
-│                                                                     │
-│    GPIO 2 (SDA) ───────┬──── Bus I2C SDA                          │
-│    GPIO 3 (SCL) ───────┼──── Bus I2C SCL                          │
-│    3.3V         ───────┼──── VCC (alimentación lógica I2C)        │
-│    GND          ───────┼──── GND común                            │
-│                        │                                           │
-└────────────────────────┼───────────────────────────────────────────┘
-                         │
-          Bus I2C (SDA + SCL + VCC + GND)
-                         │
-     ┌───────────────────┼───────────────────────────────┐
-     │                   │                               │
-     │    ┌──────────────┴──────────────┐                │
-     │    │  Todos los MCP4728 comparten │                │
-     │    │  el mismo bus I2C            │                │
-     │    └──────────────┬──────────────┘                │
-     │                   │                               │
-┌────▼────┐  ┌──────────▼──────┐           ┌────────────▼───────┐
-│MCP4728  │  │MCP4728          │    ...     │MCP4728             │
-│Chip 0   │  │Chip 1           │           │Chip 7              │
-│0x60     │  │0x61             │           │0x67                │
-│         │  │                 │           │                    │
-│ A → CAM1│  │ A → CAM3 Mic1  │           │ A → CAM15 Mic1    │
-│   Mic1  │  │ B → CAM3 Mic2  │           │ B → CAM15 Mic2    │
-│ B → CAM1│  │ C → CAM4 Mic1  │           │ C → CAM16 Mic1    │
-│   Mic2  │  │ D → CAM4 Mic2  │           │ D → CAM16 Mic2    │
-│ C → CAM2│  │                 │           │                    │
-│   Mic1  │  └────────┬────────┘           └─────────┬──────────┘
-│ D → CAM2│           │                              │
-│   Mic2  │           │                              │
-└────┬────┘           │                              │
-     │                │                              │
-     │    Salidas analógicas 0-5V                    │
-     │                │                              │
-     ▼                ▼                              ▼
+Raspberry Pi 5 (GUI Tkinter)
+│ eth0 (192.168.10.1)
+│
+└── Switch Ethernet dedicado (192.168.10.x)
+        │
+        ├── Arduino Nano Every A + W5500 (192.168.10.11:5000)
+        │       │ SPI (D10,D11,D12,D13)
+        │       │ I2C (A4=SDA, A5=SCL)
+        │       ├── MCP4728 0x60 → CAM 1-2
+        │       ├── MCP4728 0x61 → CAM 3-4
+        │       ├── MCP4728 0x62 → CAM 5-6
+        │       ├── MCP4728 0x63 → CAM 7-8
+        │       ├── MCP4728 0x64 → CAM 9-10
+        │       ├── MCP4728 0x65 → CAM 11-12
+        │       ├── MCP4728 0x66 → CAM 13-14
+        │       └── MCP4728 0x67 → CAM 15-16
+        │
+        └── Arduino Nano Every B + W5500 (192.168.10.12:5000)
+                │ (misma configuración I2C/SPI)
+                ├── MCP4728 0x60 → CAM 17-18
+                ├── ... 
+                └── MCP4728 0x67 → CAM 31-32
 ```
 
 ## Conexión por Cámara (SubD-15 Signalling Connector)
@@ -88,24 +73,31 @@ para controlar el nivel de audio de cada micrófono.
           NO conectar al DAC. El DAC se alimenta desde la Raspberry Pi.
 ```
 
-## Detalle del Bus I2C
+## Pines Arduino Nano Every
 
-```
-Raspberry Pi                MCP4728 ×8 (en paralelo)
-                    ┌──────────────────────────────────────────────┐
-  GPIO 2 (SDA) ────┤── SDA Chip0 ── SDA Chip1 ── ... ── SDA Chip7│
-  GPIO 3 (SCL) ────┤── SCL Chip0 ── SCL Chip1 ── ... ── SCL Chip7│
-  3.3V / 5V    ────┤── VDD Chip0 ── VDD Chip1 ── ... ── VDD Chip7│
-  GND          ────┤── GND Chip0 ── GND Chip1 ── ... ── GND Chip7│
-                    └──────────────────────────────────────────────┘
+### SPI (W5500 Ethernet)
+- D10 = CS
+- D11 = MOSI
+- D12 = MISO
+- D13 = SCK
 
-  ⚠️ IMPORTANTE: VDD del MCP4728 determina el voltaje máximo de salida.
-     Si VDD = 5V → salida máxima = 5V (necesario para alcanzar 4.3V)
-     Si VDD = 3.3V → salida máxima = 3.3V (INSUFICIENTE)
+### I2C (MCP4728 DAC)
+- A4 = SDA
+- A5 = SCL
 
-     Alimentar los MCP4728 con 5V desde la Raspberry Pi (pin 2 o 4).
-     El bus I2C funciona a 3.3V pero los MCP4728 son compatibles.
-```
+SPI e I2C coexisten sin conflicto.
+
+## Configuración de Red
+
+- Red Ethernet dedicada (no usar la LAN del estudio)
+- Raspberry Pi: 192.168.10.1
+- Arduino A: 192.168.10.11 (MAC: DE:AD:BE:EF:00:01)
+- Arduino B: 192.168.10.12 (MAC: DE:AD:BE:EF:00:02)
+- Puerto TCP: 5000
+- Switch: cualquier switch Ethernet no gestionado
+
+⚠️ IMPORTANTE: VDD del MCP4728 debe ser 5V para alcanzar salida de 4.3V.
+Alimentar los MCP4728 con 5V desde el Arduino (pin 5V).
 
 ## Tabla de Niveles de Ganancia
 

@@ -4,24 +4,29 @@ Control de ganancia de audio para 16 cámaras Grass Valley mediante DAC I2C (MCP
 
 ## Descripción
 
-Este sistema controla remotamente el nivel de ganancia de audio (sensibilidad de micrófono) de las XCU Grass Valley a través del conector SubD-15 (Signalling Connector). Utiliza chips DAC MCP4728 para generar voltajes analógicos precisos (0-5V) que la XCU interpreta como niveles de ganancia.
+Este sistema controla remotamente el nivel de ganancia de audio (sensibilidad de micrófono) de las XCU Grass Valley a través del conector SubD-15 (Signalling Connector). Utiliza Arduino Nano Every + W5500 Ethernet + chips DAC MCP4728 para generar voltajes analógicos precisos (0-5V) controlados desde una Raspberry Pi via TCP.
 
 ## Características
 
-- ✅ Control de 16 cámaras × 2 micrófonos = 32 canales de audio
+- ✅ Control de 32 cámaras × 2 micrófonos = 64 canales de audio
+- ✅ Arquitectura escalable: agregar nodos Arduino via Ethernet
 - ✅ 8 niveles de ganancia: -22 a -64 dBu
-- ✅ Interfaz gráfica fullscreen (Tkinter) con grid 4×4
+- ✅ Interfaz gráfica fullscreen (Tkinter) con grid 8×4
 - ✅ Nombres de cámara personalizables (doble-clic)
 - ✅ Persistencia de estados entre sesiones (JSON)
-- ✅ Modo demo para desarrollo sin hardware I2C
+- ✅ Indicador de conexión por nodo Arduino (verde/rojo)
+- ✅ Modo demo para desarrollo sin hardware
 - ✅ Interfaz en español
 
 ## Hardware
 
 ### Componentes
-- Raspberry Pi 4 o Pi 5
-- 8× MCP4728 (DAC I2C, 4 canales, 12 bits)
-- 16× Conectores SubD-15 hembra
+- Raspberry Pi 5
+- 2× Arduino Nano Every (ATmega4809)
+- 2× Módulo W5500 Ethernet
+- 16× MCP4728 (DAC I2C, 4 canales, 12 bits)
+- 1× Switch Ethernet
+- 32× Conectores SubD-15 hembra
 
 ### Conexión por XCU (SubD-15)
 - **Pin 6** → Audio 1 level ← Salida DAC (Mic 1)
@@ -31,34 +36,31 @@ Este sistema controla remotamente el nivel de ganancia de audio (sensibilidad de
 
 Ver [docs/HARDWARE.md](docs/HARDWARE.md) para esquemas detallados.
 
-## Instalación en Raspberry Pi
+## Instalación
 
-### Instalación rápida
+### Raspberry Pi (GUI)
 ```bash
 git clone https://github.com/thierry-huin/grass-valley-gpio-controller.git
 cd grass-valley-gpio-controller
 bash install.sh
 ```
 
-El script `install.sh` instala todas las dependencias (sistema + Python), habilita I2C,
-crea un entorno virtual y añade un acceso directo "GV Audio Control" en el menú
-de aplicaciones (Sound & Video) y en el escritorio.
+Crea un acceso directo "GV Audio Control" en Sound & Video y en el escritorio.
 
-### Ejecutar manualmente
-```bash
-./run.sh
-```
+### Arduino Nano Every (firmware)
+1. Abrir `arduino/gv_dac_firmware/gv_dac_firmware.ino` en Arduino IDE
+2. Cambiar IP y MAC según el nodo (ver comentarios en el sketch)
+3. Subir al Arduino Nano Every
+4. Repetir para cada nodo
 
-### Modo demo (cualquier sistema, sin hardware I2C)
+### Configuración de Red
+Configurar IP estática en la Pi (192.168.10.1) en la interfaz Ethernet dedicada.
+Los nodos Arduino se configuran en `config/nodes.json`.
+
+### Modo demo (sin hardware)
 ```bash
-pip3 install -r requirements.txt
 python3 src/gv_dac_controller.py
 ```
-
-### Notas
-- Compatible con Raspberry Pi 4 y Pi 5
-- En Pi 5 se requiere `python3-lgpio` (incluido en `install.sh`)
-- El venv se crea con `--system-site-packages` para acceder a `lgpio`
 
 ## Niveles de Ganancia
 
