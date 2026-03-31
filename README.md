@@ -19,7 +19,7 @@ Este sistema controla remotamente el nivel de ganancia de audio (sensibilidad de
 ## Hardware
 
 ### Componentes
-- Raspberry Pi 4
+- Raspberry Pi 4 o Pi 5
 - 8× MCP4728 (DAC I2C, 4 canales, 12 bits)
 - 16× Conectores SubD-15 hembra
 
@@ -31,30 +31,34 @@ Este sistema controla remotamente el nivel de ganancia de audio (sensibilidad de
 
 Ver [docs/HARDWARE.md](docs/HARDWARE.md) para esquemas detallados.
 
-## Instalación
+## Instalación en Raspberry Pi
 
-### 1. Clonar el repositorio
+### Instalación rápida
 ```bash
-git clone <repository-url>
+git clone https://github.com/thierry-huin/grass-valley-gpio-controller.git
 cd grass-valley-gpio-controller
+bash install.sh
 ```
 
-### 2. Instalar dependencias
+El script `install.sh` instala todas las dependencias (sistema + Python), habilita I2C,
+crea un entorno virtual y añade un acceso directo "GV Audio Control" en el menú
+de aplicaciones (Sound & Video) y en el escritorio.
+
+### Ejecutar manualmente
+```bash
+./run.sh
+```
+
+### Modo demo (cualquier sistema, sin hardware I2C)
 ```bash
 pip3 install -r requirements.txt
-```
-
-### 3. Ejecutar
-
-**En Raspberry Pi (producción):**
-```bash
 python3 src/gv_dac_controller.py
 ```
 
-**En cualquier sistema (modo demo):**
-```bash
-python3 src/gv_dac_controller.py
-```
+### Notas
+- Compatible con Raspberry Pi 4 y Pi 5
+- En Pi 5 se requiere `python3-lgpio` (incluido en `install.sh`)
+- El venv se crea con `--system-site-packages` para acceder a `lgpio`
 
 ## Niveles de Ganancia
 
