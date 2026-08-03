@@ -8,24 +8,27 @@
 
 ## Mapeo Completo: DAC → Cámara
 
-| Cámara | Mic 1 | Mic 2 | Chip MCP4728 | Dirección I2C |
+Todos los MCP4728 comparten la dirección I2C `0x60`; se distinguen por el
+canal del TCA9548A al que están conectados (`Chip MCP4728` = canal mux).
+
+| Cámara | Mic 1 | Mic 2 | Chip MCP4728 (canal TCA9548A) | Dirección I2C |
 |--------|-------|-------|--------------|---------------|
 | CAM 1  | Ch A  | Ch B  | 0            | 0x60          |
 | CAM 2  | Ch C  | Ch D  | 0            | 0x60          |
-| CAM 3  | Ch A  | Ch B  | 1            | 0x61          |
-| CAM 4  | Ch C  | Ch D  | 1            | 0x61          |
-| CAM 5  | Ch A  | Ch B  | 2            | 0x62          |
-| CAM 6  | Ch C  | Ch D  | 2            | 0x62          |
-| CAM 7  | Ch A  | Ch B  | 3            | 0x63          |
-| CAM 8  | Ch C  | Ch D  | 3            | 0x63          |
-| CAM 9  | Ch A  | Ch B  | 4            | 0x64          |
-| CAM 10 | Ch C  | Ch D  | 4            | 0x64          |
-| CAM 11 | Ch A  | Ch B  | 5            | 0x65          |
-| CAM 12 | Ch C  | Ch D  | 5            | 0x65          |
-| CAM 13 | Ch A  | Ch B  | 6            | 0x66          |
-| CAM 14 | Ch C  | Ch D  | 6            | 0x66          |
-| CAM 15 | Ch A  | Ch B  | 7            | 0x67          |
-| CAM 16 | Ch C  | Ch D  | 7            | 0x67          |
+| CAM 3  | Ch A  | Ch B  | 1            | 0x60          |
+| CAM 4  | Ch C  | Ch D  | 1            | 0x60          |
+| CAM 5  | Ch A  | Ch B  | 2            | 0x60          |
+| CAM 6  | Ch C  | Ch D  | 2            | 0x60          |
+| CAM 7  | Ch A  | Ch B  | 3            | 0x60          |
+| CAM 8  | Ch C  | Ch D  | 3            | 0x60          |
+| CAM 9  | Ch A  | Ch B  | 4            | 0x60          |
+| CAM 10 | Ch C  | Ch D  | 4            | 0x60          |
+| CAM 11 | Ch A  | Ch B  | 5            | 0x60          |
+| CAM 12 | Ch C  | Ch D  | 5            | 0x60          |
+| CAM 13 | Ch A  | Ch B  | 6            | 0x60          |
+| CAM 14 | Ch C  | Ch D  | 6            | 0x60          |
+| CAM 15 | Ch A  | Ch B  | 7            | 0x60          |
+| CAM 16 | Ch C  | Ch D  | 7            | 0x60          |
 
 ## Conexión SubD-15 por XCU
 

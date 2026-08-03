@@ -41,19 +41,27 @@ There are currently no automated tests. The `tests/` directory exists but is emp
 
 ## Architecture
 
-### Single-File Application
+### Two Runtime Modes (two separate scripts)
 
-The entire application lives in `src/gv_dac_controller.py`. It follows a single-class architecture pattern.
+**`src/gv_dac_controller.py` — main/production app (32 cameras)**
+- Raspberry Pi (Tkinter GUI) talks TCP to 2× Arduino Nano Every + W5500 nodes (`ArduinoNode` class, `config/nodes.json`)
+- Each Arduino node runs `arduino/gv_dac_firmware/gv_dac_firmware.ino`, which owns the I2C bus locally
+- On each node's I2C bus: 1× **TCA9548A** mux (address `0x70`, fixed via A0-A2 tied low) fans out to 8× MCP4728, **all left at the factory default address `0x60`** and isolated per TCA9548A channel (0-7)
+- The Pi never talks I2C directly — it only sends `SET <chip> <channel> <value>` over TCP, where `chip` is the **TCA9548A channel index (0-7)**, not an I2C address
+- Total: 2 nodes × 8 chips × 4 channels = 64 analog outputs for 32 cameras × 2 microphones
+- See `docs/HARDWARE.md` for the full TCA9548A pinout
 
-**Main Class: `DACControllerApp`**
-- Controls 8× MCP4728 DAC chips via I2C (addresses 0x60-0x67)
-- Each chip has 4 channels (A, B, C, D) controlling 2 cameras (2 mics each)
-- Total: 32 analog output channels for 16 cameras × 2 microphones
-- Output voltage range: 0-5V mapped to 8 gain levels (-22 to -64 dBu)
+**`src/gv_dac_controller_i2c.py` — legacy direct-I2C app (16 cameras)**
+- Runs directly on a Raspberry Pi's own I2C bus (no Arduino, no TCP), using `adafruit_mcp4728` via `board`/`busio`
+- Still assumes 8× MCP4728 reprogrammed to unique addresses `0x60`-`0x67` on the same bus (`DAC_ADDRESSES` list) — it does **not** use a TCA9548A mux
+- Kept for reference/smaller deployments; if the same addressing problem applies, it should get the same TCA9548A treatment as the Arduino firmware before relying on reprogrammed addresses
+- Total: 8 chips × 4 channels = 32 analog outputs for 16 cameras × 2 microphones
+
+Both scripts follow a single-class architecture pattern (`DACControllerApp`) with 0-5V output mapped to 8 gain levels (-22 to -64 dBu).
 
 ### Key Design Patterns
 
-**Graceful Degradation:**
+**Graceful Degradation (`gv_dac_controller_i2c.py` only):**
 ```python
 try:
     import adafruit_mcp4728
@@ -64,12 +72,11 @@ except (ImportError, RuntimeError, NotImplementedError):
     I2C_AVAILABLE = False
 ```
 
-All DAC operations are wrapped in `if I2C_AVAILABLE:` checks.
+All DAC operations in that script are wrapped in `if I2C_AVAILABLE:` checks. `gv_dac_controller.py` instead checks `node.connected` before sending TCP commands to each Arduino node.
 
 **Hardware Abstraction:**
-- `_set_dac_output(chip_index, channel, dac_value)` - Low-level DAC write
-- `_apply_gain_hardware(camera_name, mike_name, level)` - Maps camera/mic to DAC chip/channel
-- `set_microphone_gain()` - High-level: hardware + state + UI update
+- `gv_dac_controller.py`: `_apply_gain_hardware(camera_name, mike_name, level)` looks up `(node, chip_index, channel)` and calls `node.set_dac(chip_index, channel, dac_value)`, which sends the TCP `SET` command
+- `gv_dac_controller_i2c.py`: `_apply_gain_hardware(camera_name, mike_name, level)` writes directly to the `adafruit_mcp4728` object at the mapped chip/channel
 
 **State Management:**
 - `mike_states` dict is the source of truth: `{(camera_name, mike_name): gain_level}`
@@ -107,7 +114,10 @@ GAIN_PRESETS = {
 - MCP4728 must be powered with **5V** (not 3.3V) to output up to 4.3V
 - SubD-15 Pin 7 (5V from XCU) must **NOT** be connected to DAC circuit
 - All GND must be common (Raspberry Pi + DACs + XCUs)
-- MCP4728 chips come with default address 0x60; must be reprogrammed individually
+- MCP4728 chips are unreliable to reprogram to unique addresses (requires a
+  precisely-timed LDAC sequence); instead all chips stay at default address
+  0x60 and are isolated per-channel behind a TCA9548A I2C mux (address 0x70)
+  on each Arduino node's I2C bus
 
 ### Code Considerations
 
@@ -140,4 +150,4 @@ Run directly as Python script. No build system beyond `requirements.txt`.
 
 Based on the Sony HDCU-3500 relay controller project (`raspberry-pi-gpio-controller`).
 Adapted for Grass Valley XCU with analog voltage control instead of digital relay control.
-Created with assistance from Warp AI Agent.
+Created by Thierry Huin with assistance from Warp AI Agent.

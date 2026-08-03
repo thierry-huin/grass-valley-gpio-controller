@@ -1,6 +1,6 @@
 /*
  * Grass Valley XCU - DAC Controller Firmware
- * Arduino Nano Every + W5500 Ethernet + 8x MCP4728 I2C DAC
+ * Arduino Nano Every + W5500 Ethernet + TCA9548A I2C Mux + 8x MCP4728 I2C DAC
  *
  * Controls audio gain levels via MCP4728 DAC chips for Grass Valley camera XCUs.
  * Receives commands from Raspberry Pi via TCP socket.
@@ -8,11 +8,17 @@
  * Hardware:
  *   - Arduino Nano Every (ATmega4809)
  *   - W5500 Ethernet module (SPI: D10=CS, D11=MOSI, D12=MISO, D13=SCK)
- *   - 8x MCP4728 DAC (I2C: A4=SDA, A5=SCL, addresses 0x60-0x67)
+ *   - 1x TCA9548A I2C Mux (I2C: A4=SDA, A5=SCL, address 0x70)
+ *   - 8x MCP4728 DAC, one per TCA9548A channel (all at default address 0x60)
+ *
+ * NOTE: MCP4728 chips cannot be reliably reprogrammed to unique addresses
+ * (requires a precisely-timed LDAC sequence not exposed on most breakout
+ * boards), so each chip stays at its factory default address 0x60 and is
+ * isolated on its own TCA9548A mux channel (0-7) instead.
  *
  * Protocol (TCP port 5000):
- *   SET <chip> <channel> <value>  - Set DAC output (chip:0-7, ch:0-3, value:0-4095)
- *   SCAN                          - List detected I2C DAC chips
+ *   SET <chip> <channel> <value>  - Set DAC output (chip:0-7 = mux channel, ch:0-3, value:0-4095)
+ *   SCAN                          - List detected I2C DAC chips (by mux channel)
  *   PING                          - Connection test
  *   ID                            - Firmware identification
  *
@@ -39,12 +45,20 @@ IPAddress ip(192, 168, 10, 11);  // Node A: .11, Node B: .12
 const uint16_t TCP_PORT = 5000;
 
 // ============================================================
+// TCA9548A I2C Mux Configuration
+// ============================================================
+
+// TCA9548A I2C mux address (A0-A2 tied low on the breakout board)
+const uint8_t TCA9548A_ADDR = 0x70;
+
+// ============================================================
 // MCP4728 Configuration
 // ============================================================
 
-// MCP4728 base I2C address
-const uint8_t MCP4728_BASE_ADDR = 0x60;
-const uint8_t NUM_DAC_CHIPS = 8;
+// MCP4728 fixed I2C address (all chips stay at factory default,
+// isolated per TCA9548A channel below)
+const uint8_t MCP4728_ADDR = 0x60;
+const uint8_t NUM_DAC_CHIPS = 8;  // = number of TCA9548A channels used
 
 // MCP4728 Multi-Write command for single channel
 // Command: 0x40 | (channel << 1)
@@ -62,6 +76,17 @@ EthernetServer server(TCP_PORT);
 const uint8_t CMD_BUF_SIZE = 64;
 
 // ============================================================
+// TCA9548A Mux Functions
+// ============================================================
+
+void tca_select_channel(uint8_t channel) {
+  if (channel > 7) return;
+  Wire.beginTransmission(TCA9548A_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+// ============================================================
 // MCP4728 Functions (direct Wire.h, no external library)
 // ============================================================
 
@@ -69,8 +94,6 @@ void mcp4728_write_channel(uint8_t chipIndex, uint8_t channel, uint16_t value) {
   if (chipIndex >= NUM_DAC_CHIPS || !dacDetected[chipIndex]) return;
   if (channel > 3) return;
   if (value > 4095) value = 4095;
-
-  uint8_t addr = MCP4728_BASE_ADDR + chipIndex;
 
   // Multi-Write command: write single channel
   // Byte 1: 0x40 | (channel << 1) | UDAC(0)
@@ -80,7 +103,8 @@ void mcp4728_write_channel(uint8_t chipIndex, uint8_t channel, uint16_t value) {
   uint8_t msb = (value >> 8) & 0x0F;  // Upper 4 bits + VREF=0, PD=00, Gx=0
   uint8_t lsb = value & 0xFF;          // Lower 8 bits
 
-  Wire.beginTransmission(addr);
+  tca_select_channel(chipIndex);
+  Wire.beginTransmission(MCP4728_ADDR);
   Wire.write(cmd);
   Wire.write(msb);
   Wire.write(lsb);
@@ -89,8 +113,8 @@ void mcp4728_write_channel(uint8_t chipIndex, uint8_t channel, uint16_t value) {
 
 void scanI2CDevices() {
   for (uint8_t i = 0; i < NUM_DAC_CHIPS; i++) {
-    uint8_t addr = MCP4728_BASE_ADDR + i;
-    Wire.beginTransmission(addr);
+    tca_select_channel(i);
+    Wire.beginTransmission(MCP4728_ADDR);
     dacDetected[i] = (Wire.endTransmission() == 0);
   }
 }
@@ -120,9 +144,8 @@ void processCommand(EthernetClient &client, char *cmd) {
     for (uint8_t i = 0; i < NUM_DAC_CHIPS; i++) {
       if (dacDetected[i]) {
         if (!first) client.print(F(","));
-        client.print(F("0x"));
-        if (MCP4728_BASE_ADDR + i < 0x10) client.print(F("0"));
-        client.print(MCP4728_BASE_ADDR + i, HEX);
+        client.print(F("ch"));
+        client.print(i);
         first = false;
       }
     }

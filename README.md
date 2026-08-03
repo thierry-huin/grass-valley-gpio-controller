@@ -98,4 +98,4 @@ grass-valley-gpio-controller/
 
 ## Autor
 
-Creado con ayuda de Warp AI Agent.
+Creado por Thierry Huin con ayuda de Warp AI Agent.
